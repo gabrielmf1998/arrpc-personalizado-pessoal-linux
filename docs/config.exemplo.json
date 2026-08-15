@@ -1,0 +1,13 @@
+{
+  "games": {
+    "youtube-music":           { "client_id": "SEU_APPLICATION_ID" },
+    "libexec/stremio/stremio": { "client_id": "SEU_APPLICATION_ID" },
+
+    "jogo.exe": {
+      "client_id": "ID_DA_BASE_DETECTAVEL_DO_DISCORD",
+      "details": "Nome do Jogo",
+      "state": "Jogando",
+      "large_text": "Nome do Jogo"
+    }
+  }
+}

@@ -1,0 +1,209 @@
+====================================================================
+ INSTALACAO MANUAL - arRPC Personalizado Pessoal Linux
+ (passo a passo, sem script, para quando nao houver IA por perto)
+====================================================================
+
+O QUE E ISSO
+------------
+Um daemon em Python que faz o Discord mostrar jogos e apps que ele nao
+detecta sozinho no Linux. Ele procura os processos e fala o protocolo
+IPC do Discord direto, publicando a Rich Presence.
+
+Requisitos: systemd (servico de usuario), python3, ss (iproute2),
+busctl (systemd, para Stremio/YouTube Music) e um cliente Discord que
+exponha o socket de IPC - Vesktop nativo.
+
+
+--------------------------------------------------------------------
+PASSO 1 - DEPENDENCIAS
+--------------------------------------------------------------------
+Arch:
+    sudo pacman -S --needed python iproute2 systemd curl
+
+Debian / Ubuntu / Pop!_OS / Mint:
+    sudo apt update
+    sudo apt install python3 iproute2 curl
+
+Fedora / Nobara:
+    sudo dnf install python3 iproute curl
+
+openSUSE:
+    sudo zypper install python3 iproute2 curl
+
+
+--------------------------------------------------------------------
+PASSO 2 - VESKTOP NATIVO
+--------------------------------------------------------------------
+IMPORTANTE: nao use a versao Flatpak do Discord/Vesktop. O Flatpak roda
+em sandbox com /run isolado, e o socket discord-ipc-0 nao fica visivel
+para o daemon. Use pacote nativo.
+
+Arch:
+    sudo pacman -S vesktop
+
+Debian / Ubuntu:
+    1. abra https://github.com/Vencord/Vesktop/releases/latest
+    2. baixe o arquivo terminado em _amd64.deb
+    3. sudo apt install ./vesktop_*_amd64.deb
+
+Fedora:
+    1. baixe o arquivo terminado em .x86_64.rpm da mesma pagina
+    2. sudo dnf install ./vesktop-*.x86_64.rpm
+
+openSUSE:
+    1. baixe o .x86_64.rpm
+    2. sudo zypper install --allow-unsigned-rpm ./vesktop-*.x86_64.rpm
+
+Qualquer outra distro (tarball):
+    1. baixe vesktop-<versao>.tar.gz (sem sufixo de arquitetura)
+    2. sudo mkdir -p /opt/Vesktop
+    3. sudo tar -xzf vesktop-*.tar.gz -C /opt/Vesktop --strip-components=1
+    4. sudo ln -sf /opt/Vesktop/vesktop /usr/local/bin/vesktop
+
+Abra o Vesktop e faca login. Confirme que o socket existe:
+
+    ls /run/user/$(id -u)/discord-ipc-0
+
+Se esse arquivo nao aparecer, o daemon nao tem como publicar nada.
+
+
+--------------------------------------------------------------------
+PASSO 3 - O DAEMON
+--------------------------------------------------------------------
+    mkdir -p ~/.local/bin ~/.config/systemd/user
+    cp discord-game-presence.py ~/.local/bin/
+    chmod +x ~/.local/bin/discord-game-presence.py
+    cp systemd/discord-game-presence.service ~/.config/systemd/user/
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now discord-game-presence.service
+
+Conferir:
+    systemctl --user status discord-game-presence
+
+Deve dizer "active (running)". O servico ja fica habilitado para subir
+sozinho no proximo boot.
+
+
+--------------------------------------------------------------------
+PASSO 4 - STREMIO E YOUTUBE MUSIC (opcional)
+--------------------------------------------------------------------
+Esses dois nao existem na base de apps detectaveis do Discord, entao
+precisam de um Application ID criado por voce:
+
+    1. entre em https://discord.com/developers/applications
+    2. clique em "New Application" (canto superior direito)
+    3. de o nome que deve APARECER no seu perfil, ex: YouTube Music
+    4. aceite os termos e clique em Create
+    5. em "General Information", suba uma imagem em App Icon
+    6. copie o "Application ID" (numero longo)
+
+Repita para o Stremio, se quiser os dois.
+
+Agora crie ~/.config/discord-game-presence.json com os ids:
+
+{
+  "games": {
+    "youtube-music":           { "client_id": "COLE_O_ID_AQUI" },
+    "libexec/stremio/stremio": { "client_id": "COLE_O_ID_AQUI" }
+  }
+}
+
+E reinicie:
+    systemctl --user restart discord-game-presence
+
+OBS: o nome que aparece no Discord e o NOME DO APP que voce criou.
+
+
+--------------------------------------------------------------------
+PASSO 5 - MAPA DO LEFT 4 DEAD 2 (opcional)
+--------------------------------------------------------------------
+O L4D2 nao publica o mapa em lugar nenhum. A unica fonte e o log do
+console. Ative assim:
+
+    1. localize a pasta do jogo, normalmente uma destas:
+         ~/.local/share/Steam/steamapps/common/Left 4 Dead 2/left4dead2
+         /mnt/<disco>/SteamLibrary/steamapps/common/Left 4 Dead 2/left4dead2
+
+    2. crie ou edite o arquivo cfg/autoexec.cfg dentro dela e acrescente:
+         con_logfile "console.log"
+
+    3. FECHE E ABRA O JOGO. O log so passa a existir no proximo boot
+       do jogo. Ate la a presenca mostra apenas "Jogando".
+
+
+--------------------------------------------------------------------
+PASSO 6 - ADICIONAR OUTROS JOGOS
+--------------------------------------------------------------------
+a) descubra o Application ID na base publica do Discord:
+
+    curl -s https://discord.com/api/v9/applications/detectable > det.json
+    python3 - <<'FIM'
+    import json
+    for a in json.load(open('det.json')):
+        if 'parte do nome' in a['name'].lower():
+            print(a['id'], a['name'])
+    FIM
+
+b) descubra como o processo aparece:
+
+    ps aux | grep -i <nome do jogo>
+
+   Jogos sob Proton aparecem como  S:\common\Jogo\jogo.exe  - use so um
+   trecho estavel, por exemplo  jogo.exe
+
+c) acrescente ao ~/.config/discord-game-presence.json:
+
+{
+  "games": {
+    "jogo.exe": {
+      "client_id": "ID_DA_BASE",
+      "details": "Nome do Jogo",
+      "state": "Jogando",
+      "large_text": "Nome do Jogo"
+    }
+  }
+}
+
+d) systemctl --user restart discord-game-presence
+
+
+--------------------------------------------------------------------
+DIAGNOSTICO
+--------------------------------------------------------------------
+Nao aparece nada:
+    - o socket existe?      ls /run/user/$(id -u)/discord-ipc-*
+    - o servico esta vivo?  systemctl --user status discord-game-presence
+    - erros no log?         journalctl --user -u discord-game-presence -n 50
+    - Vesktop e nativo?     flatpak list | grep -i vesktop   (nao deve achar)
+    - nas configuracoes do Discord, "Status de atividade" ligado?
+
+Aparece como "Jogando" mesmo sendo musica ou serie:
+    - e limitacao do Discord: via RPC, um app comum so publica como
+      "Jogando". O type enviado (Ouvindo/Assistindo) e ignorado.
+
+Botoes de link nao aparecem:
+    - botoes nunca aparecem para voce mesmo, apenas para quem ve o seu
+      perfil. Peca para alguem conferir.
+
+O jogo abriu mas nao detectou:
+    - confirme o padrao do processo:
+        pgrep -af <padrao que voce colocou no json>
+      se nao retornar nada, o padrao esta errado.
+    - jogos mudam: L4D2, por exemplo, tem processo diferente rodando
+      nativo (hl2_linux -game left4dead2) e sob Proton (left4dead2.exe).
+
+Minecraft nao mostra o servidor:
+    - o daemon casa o IP conectado com os hosts do servers.dat da
+      instancia do Prism Launcher. Se voce entrou por IP direto, aparece
+      o IP mesmo.
+
+
+--------------------------------------------------------------------
+DESINSTALAR
+--------------------------------------------------------------------
+    systemctl --user disable --now discord-game-presence
+    rm ~/.local/bin/discord-game-presence.py
+    rm ~/.config/systemd/user/discord-game-presence.service
+    rm -f ~/.config/discord-game-presence.json
+    systemctl --user daemon-reload

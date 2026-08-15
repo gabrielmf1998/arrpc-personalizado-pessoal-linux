@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Rich Presence de jogos que o Discord nao detecta no Linux.
+
+A base de jogos detectaveis do Discord so lista executaveis win32/darwin (ou
+nenhum), entao nem o cliente nativo do RuneScape nem jogos rodando sob Proton
+sao reconhecidos. Este daemon procura os processos, fala o protocolo IPC do
+Discord direto e publica a presenca enquanto o jogo estiver aberto.
+"""
+import gzip
+import json
+import os
+import pathlib
+import re
+import socket
+import struct
+import subprocess
+import threading
+import urllib.parse
+import time
+
+PRISM = pathlib.Path.home() / ".local/share/PrismLauncher/instances"
+
+
+def mc_pid():
+    r = subprocess.run(["pgrep", "-f", "PrismLauncher/instances"], capture_output=True, text=True)
+    pids = r.stdout.split()
+    return pids[0] if pids else None
+
+
+def mc_instance(pid):
+    try:
+        cmdline = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"instances/([^/]+)/natives", cmdline)
+    return m.group(1) if m else None
+
+
+def mc_peers(pid):
+    """IPs remotos das conexoes TCP do processo, sem loopback/LAN."""
+    r = subprocess.run(["ss", "-tnp"], capture_output=True, text=True)
+    peers = []
+    for line in r.stdout.splitlines():
+        if f"pid={pid}," not in line:
+            continue
+        cols = line.split()
+        if len(cols) < 5:
+            continue
+        peer = cols[4].rsplit(":", 1)
+        ip = peer[0].strip("[]").replace("::ffff:", "")
+        if ip.startswith(("127.", "192.168.", "10.", "::1")):
+            continue
+        peers.append((ip, peer[1]))
+    return peers
+
+
+def mc_server_names(instance):
+    """Hosts salvos no servers.dat da instancia (NBT: strings legiveis bastam)."""
+    if not instance:
+        return []
+    path = PRISM / instance / "minecraft" / "servers.dat"
+    if not path.exists():
+        return []
+    data = path.read_bytes()
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    hosts = re.findall(rb"[a-zA-Z0-9][a-zA-Z0-9.\-]+\.[a-z]{2,}(?::\d+)?", data)
+    return [h.decode() for h in dict.fromkeys(hosts)]
+
+
+def mpris(prop, player="org.mpris.MediaPlayer2.Stremio"):
+    r = subprocess.run(
+        ["busctl", "--user", "--json=short", "get-property", player,
+         "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", prop],
+        capture_output=True, text=True)
+    if r.returncode:
+        return None
+    try:
+        return json.loads(r.stdout)["data"]
+    except (ValueError, KeyError):
+        return None
+
+
+def mpris_names(prefix):
+    """Bus names MPRIS que comecam com o prefixo (o do Firefox muda a cada boot)."""
+    r = subprocess.run(["busctl", "--user", "--list", "--no-legend"],
+                       capture_output=True, text=True)
+    full = f"org.mpris.MediaPlayer2.{prefix}"
+    return [line.split()[0] for line in r.stdout.splitlines()
+            if line.split() and line.split()[0].startswith(full)]
+
+
+def mpris_meta(player):
+    meta = mpris("Metadata", player) or {}
+    return {k: (v["data"] if isinstance(v, dict) else v) for k, v in meta.items()}
+
+
+def ytm_player():
+    """Player do Firefox que estiver tocando algo no YouTube Music."""
+    for name in mpris_names("firefox"):
+        url = mpris_meta(name).get("xesam:url") or ""
+        if "music.youtube.com" in url:
+            return name
+    return None
+
+
+def ytm_running():
+    return ytm_player() is not None
+
+
+def ytm_state():
+    """Musica atual, progresso na faixa e links."""
+    player = ytm_player()
+    if not player:
+        return "YouTube Music", None
+    meta = mpris_meta(player)
+    artist = meta.get("xesam:artist")
+    artist = artist[0] if isinstance(artist, list) and artist else artist
+    title = meta.get("xesam:title") or "YouTube Music"
+    label = f"{title} — {artist}" if artist else title
+
+    extra = {}
+    url = meta.get("xesam:url")
+    if url:
+        extra["buttons"] = [{"label": "Ouvir no YouTube Music", "url": url}]
+    if artist:  # o MPRIS nao traz o canal do artista, entao vai pela busca
+        query = urllib.parse.quote(artist)
+        extra.setdefault("buttons", []).append(
+            {"label": f"Artista: {artist}"[:31],
+             "url": f"https://music.youtube.com/search?q={query}"})
+
+    if mpris("PlaybackStatus", player) != "Playing":
+        return f"{label} (pausado)", extra or None
+
+    # start + end fazem o Discord mostrar "1:23 / 3:20" com barra de progresso
+    position, length = mpris("Position", player), meta.get("mpris:length")
+    if position is not None and length:
+        now = time.time()
+        extra["timestamps"] = {
+            "start": int(now - position / 1_000_000),
+            "end": int(now + (length - position) / 1_000_000),
+        }
+    return label, extra or None
+
+
+def stremio_state():
+    """Titulo em reproducao e quanto falta para acabar, via MPRIS."""
+    status = mpris("PlaybackStatus")
+    if status is None:
+        return "Aberto", None
+    meta = mpris("Metadata") or {}
+
+    def field(key):
+        v = meta.get(key)
+        return v["data"] if isinstance(v, dict) else v
+
+    title = field("xesam:title")
+    if not title:
+        return ("Navegando" if status == "Stopped" else "Assistindo"), None
+    artist = field("xesam:artist")  # serie, quando for episodio
+    series = artist[0] if isinstance(artist, list) and artist else artist
+    label = f"{series} — {title}" if series and series != title else title
+    if status != "Playing":
+        return f"{label} (pausado)", None
+
+    # o Stremio nao publica mpris:length nem Position, entao o Discord so pode
+    # contar o tempo desde o inicio deste titulo (o timer reinicia a cada troca)
+    position, length = mpris("Position"), field("mpris:length")
+    if position and length:
+        now = time.time()
+        return label, {"timestamps": {
+            "start": int(now - position / 1_000_000),
+            "end": int(now + (length - position) / 1_000_000),
+        }}
+    return label, None
+
+
+def steam_libraries():
+    """Todas as bibliotecas Steam, inclusive em outros discos."""
+    roots = [pathlib.Path.home() / ".local/share/Steam",
+             pathlib.Path.home() / ".steam/steam"]
+    libs = []
+    for root in roots:
+        vdf = root / "steamapps/libraryfolders.vdf"
+        if not vdf.exists():
+            continue
+        libs.append(root)
+        try:
+            text = vdf.read_text(errors="replace")
+        except OSError:
+            continue
+        libs += [pathlib.Path(p) for p in re.findall(r'"path"\s+"([^"]+)"', text)]
+    return list(dict.fromkeys(libs))
+
+
+def steam_game_dir(name):
+    """Pasta de um jogo instalado, procurando em todas as bibliotecas."""
+    for lib in steam_libraries():
+        path = lib / "steamapps/common" / name
+        if path.is_dir():
+            return path
+    return None
+
+
+def l4d2_log():
+    game = steam_game_dir("Left 4 Dead 2")
+    return game / "left4dead2/console.log" if game else None
+
+L4D2_MAPS = {
+    "c1": "Dead Center", "c2": "Dark Carnival", "c3": "Swamp Fever",
+    "c4": "Hard Rain", "c5": "The Parish", "c6": "The Passing",
+    "c7": "The Sacrifice", "c8": "No Mercy", "c9": "Crash Course",
+    "c10": "Death Toll", "c11": "Dead Air", "c12": "Blood Harvest",
+    "c13": "Cold Stream", "c14": "The Last Stand",
+}
+
+
+def l4d2_state():
+    """Mapa atual, lido do console.log (precisa de con_logfile no autoexec.cfg)."""
+    log = l4d2_log()
+    if not log:
+        return "Jogando", None
+    try:
+        with log.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 200_000))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return "Jogando", None
+
+    hits = re.findall(r"^(?:Loading map|Map:|Host_NewGame on map)\s*\"?([\w.]+?)\"?\s*$",
+                      tail, re.M)
+    if not hits:
+        return "No menu", None
+    slug = hits[-1].removesuffix(".bsp")
+    campaign = L4D2_MAPS.get(re.match(r"c\d+", slug).group() if re.match(r"c\d+", slug) else "")
+    m = re.search(r"m(\d+)", slug)
+    if campaign:
+        return (f"{campaign} — capítulo {m.group(1)}" if m else campaign), None
+    return slug, None
+
+
+def varint(n):
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def read_varint(sock):
+    n = shift = 0
+    while True:
+        b = sock.recv(1)
+        if not b:
+            raise ConnectionError("servidor fechou")
+        n |= (b[0] & 0x7F) << shift
+        if not b[0] & 0x80:
+            return n
+        shift += 7
+
+
+def mc_ping(host, port):
+    """Server List Ping: (online, max) de jogadores, ou None."""
+    try:
+        with socket.create_connection((host, port), timeout=4) as s:
+            h = (varint(0) + varint(765) + varint(len(host)) + host.encode()
+                 + struct.pack(">H", port) + varint(1))
+            s.sendall(varint(len(h)) + h)
+            s.sendall(varint(1) + varint(0))  # status request
+            read_varint(s)  # tamanho do pacote
+            read_varint(s)  # id do pacote
+            length = read_varint(s)
+            body = b""
+            while len(body) < length:
+                chunk = s.recv(length - len(body))
+                if not chunk:
+                    break
+                body += chunk
+            players = json.loads(body.decode("utf-8", "replace")).get("players", {})
+            return players["online"], players["max"]
+    except (OSError, ValueError, KeyError, ConnectionError):
+        return None
+
+
+def mc_state():
+    """Servidor em que o jogo esta conectado (com lotacao), ou singleplayer."""
+    pid = mc_pid()
+    if not pid:
+        return "Jogando", None
+    instance = mc_instance(pid)
+    peers = mc_peers(pid)
+    if not peers:
+        return (f"Singleplayer — {instance}" if instance else "Singleplayer"), None
+
+    # casa o IP conectado com um host salvo em servers.dat; senao mostra o IP
+    ip, port = peers[0]
+    name = ip
+    for host in mc_server_names(instance):
+        candidate = host.split(":")[0]
+        try:
+            ips = {i[4][0] for i in socket.getaddrinfo(candidate, None)}
+        except OSError:
+            continue
+        if any(p in ips for p, _ in peers):
+            name = candidate
+            break
+    else:
+        if port != "25565":
+            name = f"{ip}:{port}"
+
+    # a lotacao vai so no party; o Discord ja a escreve ao lado do state
+    return f"em {name}", mc_ping(name.split(":")[0], int(port))
+
+# nome do processo -> presenca. O client_id vem da base de jogos detectaveis
+# do Discord (https://discord.com/api/v9/applications/detectable).
+GAMES = {
+    "rs2client": {
+        "client_id": "357606832899883008",
+        "details": "RuneScape 3",
+        "state": "Gielinor",
+        "large_text": "RuneScape",
+    },
+    "TaskBarHero.exe": {
+        "client_id": "1510483737685655632",
+        "details": "TBH: Task Bar Hero",
+        "state": "Jogando",
+        "large_text": "TBH: Task Bar Hero",
+    },
+    # Toca no Firefox, entao a presenca segue o MPRIS, nao um processo proprio.
+    # Precisa de um app criado em discord.com/developers/applications.
+    "youtube-music": {
+        "client_id": "1537975657735262368",
+        "details": "YouTube Music",
+        "state": ytm_state,
+        "large_text": "YouTube Music",
+        "large_image": ("https://cdn.discordapp.com/app-icons/1537975657735262368/"
+                        "1637a3eccd8d9c22acf127e814bf088b.png"),
+        "running": ytm_running,
+        "type": 2,  # Ouvindo
+        "timer_per_title": True,
+    },
+    # O Stremio nao esta na base detectavel do Discord: o client_id vem de um app
+    # criado em discord.com/developers/applications. Sem ele, a entrada fica inativa.
+    "libexec/stremio/stremio": {
+        "client_id": "1536170931540463647",
+        "details": "Stremio",
+        "state": stremio_state,
+        "large_text": "Stremio",
+        # nao ha Art Assets no app; usa o proprio icone dele
+        "large_image": ("https://cdn.discordapp.com/app-icons/1536170931540463647/"
+                        "2c1838e508bcbe74dbafaaef7180be93.png"),
+        "type": 3,  # Assistindo
+        "timer_per_title": True,
+    },
+    "gta-sa.exe": {
+        "client_id": "363447565905166336",
+        "details": "Grand Theft Auto: San Andreas",
+        "state": "Jogando",
+        "large_text": "Grand Theft Auto: San Andreas",
+    },
+    # casa tanto o binario nativo (hl2_linux -game left4dead2) quanto o .exe sob Proton
+    "left4dead2": {
+        "client_id": "356954277803065354",
+        "details": "Left 4 Dead 2",
+        "state": l4d2_state,
+        "large_text": "Left 4 Dead 2",
+    },
+    "PrismLauncher/instances": {
+        "client_id": "1410791091501928458",
+        # o Discord ja mostra "Minecraft: Java Edition" como titulo; details repete
+        "details": lambda: mc_instance(mc_pid()) or "Minecraft",
+        "state": mc_state,  # servidor conectado, atualizado a cada poll
+        "large_text": "Minecraft",
+    },
+}
+
+POLL = 15
+
+CONFIG = pathlib.Path(
+    os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")
+) / "discord-game-presence.json"
+
+
+def load_config():
+    """Aplica ~/.config/discord-game-presence.json sobre a tabela padrao.
+
+    Formato: {"games": {"<processo>": {"client_id": "...", "details": "...",
+    "state": "...", "large_text": "...", "large_image": "..."}}}. Entradas
+    novas sao adicionadas; as existentes tem so os campos citados trocados.
+    Um client_id vazio desliga a entrada.
+    """
+    try:
+        data = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return
+    for proc, fields in (data.get("games") or {}).items():
+        if proc in GAMES:
+            GAMES[proc].update(fields)
+        elif fields.get("client_id"):
+            GAMES[proc] = {"details": proc, "state": "Jogando",
+                           "large_text": proc, **fields}
+
+
+def ipc_path():
+    base = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    for i in range(10):
+        p = os.path.join(base, f"discord-ipc-{i}")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def send(sock, op, payload):
+    data = json.dumps(payload).encode()
+    sock.sendall(struct.pack("<II", op, len(data)) + data)
+    header = sock.recv(8)
+    if len(header) < 8:
+        raise ConnectionError("IPC fechou")
+    _, length = struct.unpack("<II", header)
+    body = b""
+    while len(body) < length:
+        body += sock.recv(length - len(body))
+    return json.loads(body)
+
+
+def running(proc):
+    # a chave e o nome do processo, ou uma funcao quando o processo nao basta
+    if callable(proc):
+        return proc()
+    # -f porque processos sob Proton aparecem com caminho windows completo
+    return subprocess.run(["pgrep", "-f", proc], capture_output=True).returncode == 0
+
+
+def changed(old, new):
+    """Compara estados, tolerando o jitter do fim previsto da reproducao."""
+    if old[0] != new[0] or type(old[1]) is not type(new[1]):
+        return True
+    if isinstance(new[1], dict):  # so republica em pausa/seek, nao a cada poll
+        if new[1].get("buttons") != old[1].get("buttons"):
+            return True
+        ends = (new[1].get("timestamps", {}).get("end", 0),
+                old[1].get("timestamps", {}).get("end", 0))
+        return abs(ends[0] - ends[1]) > 5
+    return old[1] != new[1]
+
+
+def session(proc, game):
+    """Publica a presenca de uma partida, do inicio ao fim do jogo."""
+    path = ipc_path()
+    if not path:
+        return
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    send(sock, 0, {"v": 1, "client_id": game["client_id"]})
+
+    start = int(time.time())
+
+    def publish(state, restart_timer=False):
+        # o segundo item e o tamanho da party (lista) ou campos extras (dict:
+        # "timestamps" e "buttons")
+        nonlocal start
+        text, extra = state
+        if restart_timer:  # titulo novo: o contador recomeca do zero
+            start = int(time.time())
+        details = game["details"]
+        fields = extra if isinstance(extra, dict) else {}
+        activity = {
+            "type": game.get("type", 0),
+            "details": details() if callable(details) else details,
+            "state": text,
+            "timestamps": fields.get("timestamps", {"start": start}),
+            "assets": {
+                # nome de um Art Asset do app, ou uma URL de imagem
+                "large_image": game.get("large_image", "game"),
+                "large_text": game["large_text"],
+            },
+        }
+        if fields.get("buttons"):
+            activity["buttons"] = fields["buttons"][:2]  # o Discord aceita 2
+        if extra and not isinstance(extra, dict):  # "(45 of 1000)" ao lado do state
+            activity["party"] = {"id": game["client_id"], "size": list(extra)}
+        send(sock, 1, {
+            "cmd": "SET_ACTIVITY",
+            "args": {"pid": os.getpid(), "activity": activity},
+            "nonce": str(time.time()),
+        })
+
+    def current_state():
+        s = game["state"]
+        return s() if callable(s) else (s, None)
+
+    state = current_state()
+    publish(state)
+
+    try:
+        while running(proc):
+            time.sleep(POLL)
+            new = current_state()
+            if changed(state, new):  # ex.: trocou de servidor, deu seek/pausa
+                restart = game.get("timer_per_title") and new[0] != state[0]
+                state = new
+                publish(state, restart)
+    finally:
+        send(sock, 1, {"cmd": "SET_ACTIVITY", "args": {"pid": os.getpid()},
+                       "nonce": str(time.time())})
+        sock.close()
+
+
+def watch(proc, game):
+    """Espera o jogo abrir, publica a presenca, repete."""
+    alive = game.get("running", proc)
+    while True:
+        if running(alive):
+            try:
+                session(alive, game)
+            except (OSError, ConnectionError, ValueError):
+                pass  # Discord fechado ou IPC caiu; tenta de novo depois
+        time.sleep(POLL)
+
+
+def main():
+    load_config()
+    for proc, game in GAMES.items():
+        if not game.get("client_id"):
+            continue  # sem Application ID configurado
+        threading.Thread(target=watch, args=(proc, game), daemon=True).start()
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()

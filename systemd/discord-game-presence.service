@@ -1,0 +1,10 @@
+[Unit]
+Description=Rich Presence de jogos nao detectados pelo Discord
+
+[Service]
+ExecStart=%h/.local/bin/discord-game-presence.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
