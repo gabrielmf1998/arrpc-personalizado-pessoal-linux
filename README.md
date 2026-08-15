@@ -44,9 +44,33 @@ presença. Não depende do arRPC oficial nem de plugin do Vencord.
 
 ### Um comando (qualquer distro)
 
+Como o repositório é **privado**, o jeito mais simples é clonar autenticado
+(o `gh` já cuida do token):
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gabrielmf1998/arrpc-personalizado-pessoal-linux/main/install.sh | bash
+gh repo clone gabrielmf1998/arrpc-personalizado-pessoal-linux
+cd arrpc-personalizado-pessoal-linux && ./install.sh
 ```
+
+Ou pelo GitLab:
+
+```bash
+glab repo clone gabriel17166/arrpc-personalizado-pessoal-linux
+cd arrpc-personalizado-pessoal-linux && ./install.sh
+```
+
+Numa máquina sem `gh`/`glab`, use um token com escopo `repo`:
+
+```bash
+export GITHUB_TOKEN=ghp_seu_token
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/gabrielmf1998/arrpc-personalizado-pessoal-linux/main/install.sh \
+  | bash -s
+```
+
+O `install.sh` repassa esse `GITHUB_TOKEN` ao baixar os demais arquivos. Se um
+dia o repositório virar público, o `curl ... | bash` puro passa a funcionar sem
+token.
 
 O instalador:
 

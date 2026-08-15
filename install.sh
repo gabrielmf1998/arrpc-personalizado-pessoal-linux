@@ -8,6 +8,8 @@
 set -euo pipefail
 
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/gabrielmf1998/arrpc-personalizado-pessoal-linux/main}"
+# o repositorio e privado: raw.githubusercontent exige token nesse caso
+GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
 SKIP_VESKTOP="${SKIP_VESKTOP:-0}"
@@ -17,6 +19,15 @@ warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -ne 0 ] || die "rode como usuario normal, nao root (o servico e --user)"
+
+fetch() {
+    # baixa uma URL do repositorio, com token quando ele for privado
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$1" -o "$2"
+    else
+        curl -fsSL "$1" -o "$2"
+    fi
+}
 
 detect_distro() {
     [ -r /etc/os-release ] || { echo unknown; return; }
@@ -114,10 +125,12 @@ install_daemon() {
         install -m 644 "$(dirname "$0")/systemd/discord-game-presence.service" \
             "$UNIT_DIR/discord-game-presence.service"
     else  # instalacao via curl | bash: baixa do repositorio
-        curl -fsSL "$REPO_RAW/discord-game-presence.py" -o "$BIN_DIR/discord-game-presence.py"
+        fetch "$REPO_RAW/discord-game-presence.py" "$BIN_DIR/discord-game-presence.py" \
+            || die "falhou baixar o daemon (repo privado: exporte GITHUB_TOKEN)"
         chmod 755 "$BIN_DIR/discord-game-presence.py"
-        curl -fsSL "$REPO_RAW/systemd/discord-game-presence.service" \
-            -o "$UNIT_DIR/discord-game-presence.service"
+        fetch "$REPO_RAW/systemd/discord-game-presence.service" \
+            "$UNIT_DIR/discord-game-presence.service" \
+            || die "falhou baixar o service (repo privado: exporte GITHUB_TOKEN)"
     fi
 
     systemctl --user daemon-reload
