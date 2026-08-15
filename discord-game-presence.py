@@ -16,6 +16,7 @@ import struct
 import subprocess
 import threading
 import urllib.parse
+import urllib.request
 import time
 
 PRISM = pathlib.Path.home() / ".local/share/PrismLauncher/instances"
@@ -108,6 +109,39 @@ def ytm_running():
     return ytm_player() is not None
 
 
+_ART_CACHE = {}
+
+
+def ytm_art(meta):
+    """Capa da musica. O Firefox nao publica mpris:artUrl, entao: miniatura do
+    video quando a URL traz o id, senao a capa do album pela busca do iTunes."""
+    url = meta.get("xesam:url") or ""
+    video = re.search(r"[?&]v=([\w-]{11})", url)
+    if video:
+        return f"https://i.ytimg.com/vi/{video.group(1)}/hqdefault.jpg"
+
+    artist = meta.get("xesam:artist")
+    artist = artist[0] if isinstance(artist, list) and artist else artist
+    term = " ".join(filter(None, [artist, meta.get("xesam:title")])).strip()
+    if not term:
+        return None
+    if term in _ART_CACHE:
+        return _ART_CACHE[term]
+
+    art = None
+    try:
+        query = urllib.parse.urlencode({"term": term, "media": "music", "limit": 1})
+        with urllib.request.urlopen(
+                f"https://itunes.apple.com/search?{query}", timeout=5) as r:
+            results = json.loads(r.read().decode("utf-8", "replace")).get("results")
+        if results:
+            art = results[0].get("artworkUrl100", "").replace("100x100", "600x600")
+    except (OSError, ValueError):
+        pass
+    _ART_CACHE[term] = art
+    return art
+
+
 def ytm_state():
     """Musica atual, progresso na faixa e links."""
     player = ytm_player()
@@ -120,6 +154,10 @@ def ytm_state():
     label = f"{title} — {artist}" if artist else title
 
     extra = {}
+    art = ytm_art(meta)
+    if art:  # capa da musica no lugar do icone do app
+        extra["large_image"] = art
+        extra["large_text"] = meta.get("xesam:album") or title
     url = meta.get("xesam:url")
     if url:
         extra["buttons"] = [{"label": "Ouvir no YouTube Music", "url": url}]
@@ -474,9 +512,10 @@ def session(proc, game):
             "state": text,
             "timestamps": fields.get("timestamps", {"start": start}),
             "assets": {
-                # nome de um Art Asset do app, ou uma URL de imagem
-                "large_image": game.get("large_image", "game"),
-                "large_text": game["large_text"],
+                # nome de um Art Asset do app, ou uma URL de imagem; o state
+                # pode trocar a arte a cada faixa (capa da musica, por exemplo)
+                "large_image": fields.get("large_image") or game.get("large_image", "game"),
+                "large_text": fields.get("large_text") or game["large_text"],
             },
         }
         if fields.get("buttons"):
