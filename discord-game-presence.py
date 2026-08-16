@@ -96,17 +96,157 @@ def mpris_meta(player):
     return {k: (v["data"] if isinstance(v, dict) else v) for k, v in meta.items()}
 
 
-def ytm_player():
-    """Player do Firefox que estiver tocando algo no YouTube Music."""
+_POSITION_ANCHOR = {}
+_LAST_TRACK = {}
+_LENGTH_CACHE = {}
+
+
+def track_length(key, meta, video=None):
+    """Duracao da faixa, em microssegundos.
+
+    O Firefox publica mpris:length de forma intermitente - some do metadata no
+    meio da reproducao. O ultimo valor visto fica guardado por faixa e, para
+    video do YouTube, a duracao ainda pode ser lida da propria pagina.
+    """
+    length = meta.get("mpris:length")
+    if length:
+        _LENGTH_CACHE[key] = length
+        return length
+    if key in _LENGTH_CACHE:
+        return _LENGTH_CACHE[key]
+    if video:
+        length = youtube_length(video)
+        if length:
+            _LENGTH_CACHE[key] = length
+    return length
+
+
+def youtube_length(video):
+    """Duracao de um video do YouTube, lida da pagina (em microssegundos)."""
+    try:
+        request = urllib.request.Request(
+            f"https://www.youtube.com/watch?v={video}",
+            headers={"User-Agent": "Mozilla/5.0"})
+        # a duracao so aparece perto de 1 MB de HTML, entao nao adianta cortar cedo
+        with urllib.request.urlopen(request, timeout=8) as r:
+            page = r.read(2_000_000).decode("utf-8", "replace")
+    except OSError:
+        return None
+    m = re.search(r'"lengthSeconds":"(\d+)"', page)
+    return int(m.group(1)) * 1_000_000 if m else None
+
+
+def mpris_position(player, track="", paused=False):
+    """Posicao atual em microssegundos, estimada quando preciso.
+
+    O Firefox so atualiza Position quando a pagina manda: fora desses momentos
+    ele devolve 0 fixo, mesmo com o video no meio. Entao guardamos a ultima
+    posicao real vista (ou zero, no comeco de uma faixa nova) junto do instante
+    em que a vimos, e projetamos dali. Qualquer leitura real posterior
+    reancora, o que corrige tambem os seeks do usuario.
+    """
+    key = (player, track)
+    reported = mpris("Position", player)
+    now = time.monotonic()
+
+    if reported:  # leitura confiavel: reancora
+        _POSITION_ANCHOR[key] = (reported, now)
+        _LAST_TRACK[player] = track
+        return reported
+    if reported is None:  # player sumiu
+        return None
+
+    anchor = _POSITION_ANCHOR.get(key)
+    if anchor is None:
+        # zero so vale como inicio de faixa se a troca aconteceu sob nosso olhar;
+        # na primeira vez que vemos um player o video pode estar no meio, e
+        # ancorar em zero mostraria um progresso errado
+        previous = _LAST_TRACK.get(player)
+        _LAST_TRACK[player] = track
+        if previous is None or previous == track:
+            return None
+        _POSITION_ANCHOR[key] = (0, now)
+        return 0
+    position, seen = anchor
+    if paused:  # em pausa a posicao nao anda: so adia a ancora
+        _POSITION_ANCHOR[key] = (position, now)
+        return position
+    return position + int((now - seen) * 1_000_000)
+
+
+def firefox_player(wanted):
+    """Player do Firefox cuja aba casa com o site pedido.
+
+    O bus name muda a cada boot, e cada aba com midia vira um player; entao a
+    escolha e pela URL, nao pelo nome.
+    """
     for name in mpris_names("firefox"):
         url = mpris_meta(name).get("xesam:url") or ""
-        if "music.youtube.com" in url:
+        if wanted(url):
             return name
     return None
 
 
+def is_ytm(url):
+    return "music.youtube.com" in url
+
+
+def is_youtube(url):
+    return "youtube.com" in url and not is_ytm(url)
+
+
+def ytm_player():
+    return firefox_player(is_ytm)
+
+
 def ytm_running():
     return ytm_player() is not None
+
+
+def yt_running():
+    return firefox_player(is_youtube) is not None
+
+
+def yt_title():
+    """Titulo do video, que vai na primeira linha da presenca."""
+    player = firefox_player(is_youtube)
+    if not player:
+        return "YouTube"
+    return (mpris_meta(player).get("xesam:title") or "YouTube")[:128]
+
+
+def yt_state():
+    """Video em reproducao no YouTube: titulo, canal, capa e progresso."""
+    player = firefox_player(is_youtube)
+    if not player:
+        return "YouTube", None
+    meta = mpris_meta(player)
+    channel = meta.get("xesam:artist")
+    channel = channel[0] if isinstance(channel, list) and channel else channel
+    title = meta.get("xesam:title") or "YouTube"
+
+    extra = {}
+    url = meta.get("xesam:url") or ""
+    video = re.search(r"[?&]v=([\w-]{11})", url)
+    if video:  # miniatura do proprio video como icone
+        extra["large_image"] = f"https://i.ytimg.com/vi/{video.group(1)}/hqdefault.jpg"
+        extra["large_text"] = title[:128]
+        extra["buttons"] = [{"label": "Assistir no YouTube",
+                             "url": f"https://youtu.be/{video.group(1)}"}]
+
+    if mpris("PlaybackStatus", player) != "Playing":
+        mpris_position(player, title, paused=True)  # congela o progresso
+        return f"{channel} (pausado)" if channel else "Pausado", extra or None
+
+    position = mpris_position(player, title)
+    length = track_length(title, meta, video.group(1) if video else None)
+    if position is not None and length:
+        now = time.time()
+        extra["timestamps"] = {
+            "start": int(now - position / 1_000_000),
+            "end": int(now + (length - position) / 1_000_000),
+        }
+    return (channel or "YouTube"), extra or None
 
 
 _ART_CACHE = {}
@@ -168,10 +308,11 @@ def ytm_state():
              "url": f"https://music.youtube.com/search?q={query}"})
 
     if mpris("PlaybackStatus", player) != "Playing":
+        mpris_position(player, title, paused=True)  # congela o progresso
         return f"{label} (pausado)", extra or None
 
-    # start + end fazem o Discord mostrar "1:23 / 3:20" com barra de progresso
-    position, length = mpris("Position", player), meta.get("mpris:length")
+    # start + end dao ao Discord o quanto ja passou e o quanto falta
+    position, length = mpris_position(player, title), track_length(title, meta)
     if position is not None and length:
         now = time.time()
         extra["timestamps"] = {
@@ -378,6 +519,20 @@ GAMES = {
                         "1637a3eccd8d9c22acf127e814bf088b.png"),
         "running": ytm_running,
         "type": 2,  # Ouvindo
+        "timer_per_title": True,
+    },
+    # Videos comuns do YouTube, tambem no Firefox e tambem via MPRIS. Precisa de
+    # um app proprio: "YouTube" nao existe na base detectavel do Discord.
+    "youtube": {
+        "client_id": "1538427046760423474",
+        "details": yt_title,   # titulo do video
+        # usado quando o video nao expoe id na URL (live, shorts, embed)
+        "large_image": ("https://cdn.discordapp.com/app-icons/1538427046760423474/"
+                        "3f7a95b3c425b18bda601ff2f2e44b2d.png"),
+        "state": yt_state,     # canal, capa e progresso
+        "large_text": "YouTube",
+        "running": yt_running,
+        "type": 3,  # Assistindo
         "timer_per_title": True,
     },
     # O Stremio nao esta na base detectavel do Discord: o client_id vem de um app

@@ -1,5 +1,6 @@
 ====================================================================
- INSTALACAO MANUAL - arRPC Personalizado Pessoal Linux
+ arRPC Personalizado Pessoal Linux
+ INSTALACAO E CUSTOMIZACAO NA MAO
  (passo a passo, sem script, para quando nao houver IA por perto)
 ====================================================================
 
@@ -10,9 +11,32 @@ detecta sozinho no Linux. Ele procura os processos e fala o protocolo
 IPC do Discord direto, publicando a Rich Presence.
 
 Requisitos: systemd (servico de usuario), python3, ss (iproute2),
-busctl (systemd, para Stremio/YouTube Music) e um cliente Discord que
-exponha o socket de IPC - Vesktop nativo.
+busctl (systemd, para apps de midia) e um cliente Discord que exponha
+o socket de IPC - Vesktop nativo.
 
+INDICE
+------
+  PARTE 1 - INSTALACAO
+    1. dependencias
+    2. vesktop nativo
+    3. o daemon
+  PARTE 2 - CUSTOMIZACAO (adicionar seus apps)
+    4. como o daemon decide o que mostrar
+    5. adicionar um JOGO que existe na base do Discord
+    6. adicionar um APP qualquer (criando um Application ID)
+    7. trocar os apps de midia pelos seus
+    8. campos disponiveis, um por um
+    9. exemplos prontos
+   10. quando o JSON nao basta (mexer no Python)
+  PARTE 3 - EXTRAS
+   11. mapa do Left 4 Dead 2
+   12. diagnostico
+   13. desinstalar
+
+
+####################################################################
+ PARTE 1 - INSTALACAO
+####################################################################
 
 --------------------------------------------------------------------
 PASSO 1 - DEPENDENCIAS
@@ -85,38 +109,258 @@ Deve dizer "active (running)". O servico ja fica habilitado para subir
 sozinho no proximo boot.
 
 
+####################################################################
+ PARTE 2 - CUSTOMIZACAO: COLOCANDO OS SEUS APPS
+####################################################################
+
 --------------------------------------------------------------------
-PASSO 4 - STREMIO E YOUTUBE MUSIC (opcional)
+PASSO 4 - COMO O DAEMON DECIDE O QUE MOSTRAR
 --------------------------------------------------------------------
-Esses dois nao existem na base de apps detectaveis do Discord, entao
-precisam de um Application ID criado por voce:
+Existem duas camadas:
+
+  a) uma tabela padrao dentro do proprio discord-game-presence.py
+     (chamada GAMES), com os apps que ja vem configurados;
+
+  b) o SEU arquivo, em:
+
+         ~/.config/discord-game-presence.json
+
+     que e aplicado POR CIMA da tabela padrao.
+
+Regras da sobreposicao:
+  - processo que nao existe na tabela  -> entrada nova, adicionada
+  - processo que ja existe             -> so os campos citados mudam
+  - client_id vazio ("")               -> desliga aquela entrada
+
+Ou seja: para customizar, voce nunca precisa editar o Python. Cria o
+JSON, reinicia o servico e pronto.
+
+Como o daemon acha o app: ele roda, por baixo, o equivalente a
+
+    pgrep -f "<o que voce escreveu como chave>"
+
+Isso significa que QUALQUER pedaco da linha de comando serve. E por isso
+que da certo com jogos sob Proton, cujo processo aparece com caminho do
+Windows, tipo:
+
+    S:\common\Left 4 Dead 2\left4dead2.exe
+
+Nesse caso basta usar  left4dead2  como chave.
+
+
+--------------------------------------------------------------------
+PASSO 5 - ADICIONAR UM JOGO QUE EXISTE NA BASE DO DISCORD
+--------------------------------------------------------------------
+5.1) descubra o Application ID na base publica do Discord:
+
+    curl -s https://discord.com/api/v9/applications/detectable > det.json
+    python3 - <<'FIM'
+    import json
+    for a in json.load(open('det.json')):
+        if 'parte do nome' in a['name'].lower():
+            print(a['id'], a['name'])
+    FIM
+
+    Troque 'parte do nome' por um pedaco do nome do jogo, em minusculas.
+    Ex: 'terraria', 'hollow', 'counter-strike'.
+
+5.2) descubra como o processo aparece. Com o jogo ABERTO:
+
+    ps aux | grep -i <nome do jogo>
+
+    Escolha um trecho ESTAVEL da linha - de preferencia o nome do
+    executavel. Evite caminhos completos e numeros de versao, que mudam.
+
+5.3) teste o trecho escolhido antes de escrever no JSON:
+
+    pgrep -af "<seu trecho>"
+
+    Se nao imprimir nada, o trecho esta errado. Se imprimir varias
+    linhas, tudo bem: basta uma para o daemon considerar o jogo aberto.
+
+5.4) escreva em ~/.config/discord-game-presence.json:
+
+{
+  "games": {
+    "meujogo.exe": {
+      "client_id": "1234567890",
+      "details": "Meu Jogo",
+      "state": "Jogando",
+      "large_text": "Meu Jogo"
+    }
+  }
+}
+
+5.5) systemctl --user restart discord-game-presence
+
+
+--------------------------------------------------------------------
+PASSO 6 - ADICIONAR UM APP QUALQUER (SEM ID NA BASE)
+--------------------------------------------------------------------
+Apps que nao sao jogos (Stremio, YouTube, VLC, Spotify alternativo,
+qualquer coisa) nao existem na base do Discord. Voce cria um app seu:
 
     1. entre em https://discord.com/developers/applications
+       (no NAVEGADOR - nao e a opcao "Modo de Teste de Aplicativos"
+        que fica dentro do cliente do Discord)
     2. clique em "New Application" (canto superior direito)
-    3. de o nome que deve APARECER no seu perfil, ex: YouTube Music
+    3. de o nome que deve APARECER no seu perfil. Ex: VLC
     4. aceite os termos e clique em Create
     5. em "General Information", suba uma imagem em App Icon
     6. copie o "Application ID" (numero longo)
 
-Repita para o Stremio, se quiser os dois.
+ATENCAO: o nome exibido no Discord e o NOME DO APP que voce criou.
+O campo "details" do JSON e a linha de baixo, nao o titulo.
 
-Agora crie ~/.config/discord-game-presence.json com os ids:
+Depois e igual ao passo 5.4: escreva a entrada com esse client_id.
 
-{
-  "games": {
-    "youtube-music":           { "client_id": "COLE_O_ID_AQUI" },
-    "libexec/stremio/stremio": { "client_id": "COLE_O_ID_AQUI" }
-  }
-}
+Sobre a imagem: se voce nao subir Art Assets, pode usar o proprio icone
+do app como imagem grande. A URL e:
 
-E reinicie:
-    systemctl --user restart discord-game-presence
+    https://cdn.discordapp.com/app-icons/<APPLICATION_ID>/<ICON_HASH>.png
 
-OBS: o nome que aparece no Discord e o NOME DO APP que voce criou.
+Para descobrir o ICON_HASH:
+
+    curl -s https://discord.com/api/v9/applications/<APPLICATION_ID>/rpc
+
+Procure o campo "icon" na resposta. Coloque a URL montada no campo
+"large_image".
 
 
 --------------------------------------------------------------------
-PASSO 5 - MAPA DO LEFT 4 DEAD 2 (opcional)
+PASSO 7 - TROCAR OS APPS DE MIDIA PELOS SEUS
+--------------------------------------------------------------------
+Stremio, YouTube e YouTube Music vem apontando para apps criados pelo
+autor. Se voce quiser o SEU app (com o seu icone), sobrescreva so o id:
+
+{
+  "games": {
+    "youtube":                 { "client_id": "SEU_ID" },
+    "youtube-music":           { "client_id": "SEU_ID" },
+    "libexec/stremio/stremio": { "client_id": "SEU_ID" }
+  }
+}
+
+Para DESLIGAR um app que voce nao usa, deixe o id vazio:
+
+{
+  "games": {
+    "rs2client": { "client_id": "" }
+  }
+}
+
+
+--------------------------------------------------------------------
+PASSO 8 - CAMPOS DISPONIVEIS, UM POR UM
+--------------------------------------------------------------------
+client_id    Application ID. Obrigatorio. Vazio desliga a entrada.
+
+details      Primeira linha da presenca, embaixo do nome do app.
+
+state        Segunda linha.
+
+large_text   Texto que aparece ao passar o mouse na imagem grande.
+
+large_image  Imagem grande. Aceita duas coisas:
+               - o NOME de um Art Asset que voce subiu no portal, em
+                 Rich Presence > Art Assets   (ex: "game")
+               - uma URL de imagem
+                 (ex: "https://cdn.discordapp.com/app-icons/.../x.png")
+
+type         0 = Jogando (padrao)
+             2 = Ouvindo
+             3 = Assistindo
+             OBS: hoje o Discord IGNORA esse campo via RPC e mostra
+             tudo como "Jogando". Deixe como referencia.
+
+running      (so no Python) funcao que decide se o app esta ativo,
+             para casos em que olhar o processo nao basta - como uma
+             aba de navegador.
+
+
+--------------------------------------------------------------------
+PASSO 9 - EXEMPLOS PRONTOS
+--------------------------------------------------------------------
+Um jogo simples:
+
+{
+  "games": {
+    "terraria": {
+      "client_id": "356875570916753438",
+      "details": "Terraria",
+      "state": "Jogando",
+      "large_text": "Terraria"
+    }
+  }
+}
+
+Um jogo sob Proton (repare que basta o nome do .exe):
+
+{
+  "games": {
+    "eldenring.exe": {
+      "client_id": "961084435603689502",
+      "details": "ELDEN RING",
+      "state": "Nas Terras Intermedias",
+      "large_text": "ELDEN RING"
+    }
+  }
+}
+
+Varios de uma vez, mais desligar um que nao uso:
+
+{
+  "games": {
+    "terraria":  { "client_id": "356875570916753438",
+                   "details": "Terraria", "state": "Jogando",
+                   "large_text": "Terraria" },
+    "factorio":  { "client_id": "356878059691868160",
+                   "details": "Factorio", "state": "A fabrica cresce",
+                   "large_text": "Factorio" },
+    "rs2client": { "client_id": "" }
+  }
+}
+
+Cuidado com JSON: sem virgula sobrando no ultimo item, aspas duplas
+sempre. Para validar antes de reiniciar:
+
+    python3 -m json.tool ~/.config/discord-game-presence.json
+
+
+--------------------------------------------------------------------
+PASSO 10 - QUANDO O JSON NAO BASTA
+--------------------------------------------------------------------
+Presencas que MUDAM sozinhas (servidor do Minecraft, mapa do L4D2,
+musica tocando) sao funcoes Python na tabela GAMES, dentro do arquivo
+~/.local/bin/discord-game-presence.py.
+
+Regras:
+  - "details" e "state" aceitam texto OU uma funcao sem argumentos
+  - a funcao de "state" pode devolver:
+        "texto"                      -> so a linha
+        ("texto", None)              -> igual
+        ("texto", {...})             -> com extras
+  - os extras aceitos no dicionario:
+        "timestamps": {"start": ..., "end": ...}   tempo/progresso
+        "buttons":    [{"label": "...", "url": "..."}]   ate 2 botoes
+        "large_image" / "large_text"   troca a imagem a cada faixa
+  - devolver uma LISTA no lugar do dicionario vira party:
+        ("em servidor", [45, 1000])  -> mostra "(45 of 1000)"
+
+Os detectores que ja existem (mc_state, l4d2_state, yt_state,
+ytm_state, stremio_state) servem de modelo - copie o mais parecido.
+
+Depois de editar o Python:
+    systemctl --user restart discord-game-presence
+    journalctl --user -u discord-game-presence -n 30
+
+
+####################################################################
+ PARTE 3 - EXTRAS
+####################################################################
+
+--------------------------------------------------------------------
+PASSO 11 - MAPA DO LEFT 4 DEAD 2
 --------------------------------------------------------------------
 O L4D2 nao publica o mapa em lugar nenhum. A unica fonte e o log do
 console. Ative assim:
@@ -133,74 +377,46 @@ console. Ative assim:
 
 
 --------------------------------------------------------------------
-PASSO 6 - ADICIONAR OUTROS JOGOS
---------------------------------------------------------------------
-a) descubra o Application ID na base publica do Discord:
-
-    curl -s https://discord.com/api/v9/applications/detectable > det.json
-    python3 - <<'FIM'
-    import json
-    for a in json.load(open('det.json')):
-        if 'parte do nome' in a['name'].lower():
-            print(a['id'], a['name'])
-    FIM
-
-b) descubra como o processo aparece:
-
-    ps aux | grep -i <nome do jogo>
-
-   Jogos sob Proton aparecem como  S:\common\Jogo\jogo.exe  - use so um
-   trecho estavel, por exemplo  jogo.exe
-
-c) acrescente ao ~/.config/discord-game-presence.json:
-
-{
-  "games": {
-    "jogo.exe": {
-      "client_id": "ID_DA_BASE",
-      "details": "Nome do Jogo",
-      "state": "Jogando",
-      "large_text": "Nome do Jogo"
-    }
-  }
-}
-
-d) systemctl --user restart discord-game-presence
-
-
---------------------------------------------------------------------
-DIAGNOSTICO
+PASSO 12 - DIAGNOSTICO
 --------------------------------------------------------------------
 Nao aparece nada:
     - o socket existe?      ls /run/user/$(id -u)/discord-ipc-*
     - o servico esta vivo?  systemctl --user status discord-game-presence
     - erros no log?         journalctl --user -u discord-game-presence -n 50
-    - Vesktop e nativo?     flatpak list | grep -i vesktop   (nao deve achar)
+    - Vesktop e nativo?     flatpak list | grep -i vesktop  (nao deve achar)
     - nas configuracoes do Discord, "Status de atividade" ligado?
 
+O app abriu mas nao detectou:
+    - teste o padrao:  pgrep -af "<o que voce pos como chave>"
+      se nao retorna nada, o padrao esta errado
+    - o JSON e valido?  python3 -m json.tool ~/.config/discord-game-presence.json
+    - o mesmo jogo pode ter processo diferente conforme o modo: L4D2
+      nativo e "hl2_linux -game left4dead2", sob Proton e
+      "left4dead2.exe". Use um trecho que sirva aos dois: left4dead2
+
 Aparece como "Jogando" mesmo sendo musica ou serie:
-    - e limitacao do Discord: via RPC, um app comum so publica como
-      "Jogando". O type enviado (Ouvindo/Assistindo) e ignorado.
+    - limitacao do Discord: via RPC, app comum so publica como
+      "Jogando". O type enviado e ignorado.
 
 Botoes de link nao aparecem:
     - botoes nunca aparecem para voce mesmo, apenas para quem ve o seu
       perfil. Peca para alguem conferir.
 
-O jogo abriu mas nao detectou:
-    - confirme o padrao do processo:
-        pgrep -af <padrao que voce colocou no json>
-      se nao retornar nada, o padrao esta errado.
-    - jogos mudam: L4D2, por exemplo, tem processo diferente rodando
-      nativo (hl2_linux -game left4dead2) e sob Proton (left4dead2.exe).
+Musica/video sem barra de tempo:
+    - o Firefox as vezes nao publica a posicao nem a duracao. Quando a
+      posicao e desconhecida o daemon prefere nao mostrar tempo a
+      mostrar tempo errado. Trocar de faixa costuma resolver.
+    - o Stremio nunca publica posicao: nele o tempo conta desde que o
+      titulo comecou.
 
-Minecraft nao mostra o servidor:
-    - o daemon casa o IP conectado com os hosts do servers.dat da
-      instancia do Prism Launcher. Se voce entrou por IP direto, aparece
-      o IP mesmo.
+Presenca "presa", de algo que ja fechei:
+    - quem segura e o cliente. Reinicie os dois:
+        systemctl --user restart discord-game-presence
+        pkill vesktop && setsid vesktop >/dev/null 2>&1 &
 
 
 --------------------------------------------------------------------
-DESINSTALAR
+PASSO 13 - DESINSTALAR
 --------------------------------------------------------------------
     systemctl --user disable --now discord-game-presence
     rm ~/.local/bin/discord-game-presence.py

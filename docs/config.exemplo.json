@@ -1,13 +1,19 @@
 {
+  "_comentario": "Copie para ~/.config/discord-game-presence.json e ajuste. Este arquivo e aplicado por cima da tabela padrao do daemon: entradas novas sao adicionadas, entradas existentes tem so os campos citados trocados, client_id vazio desliga.",
+
   "games": {
+    "youtube":                 { "client_id": "SEU_APPLICATION_ID" },
     "youtube-music":           { "client_id": "SEU_APPLICATION_ID" },
     "libexec/stremio/stremio": { "client_id": "SEU_APPLICATION_ID" },
 
-    "jogo.exe": {
-      "client_id": "ID_DA_BASE_DETECTAVEL_DO_DISCORD",
+    "meujogo.exe": {
+      "client_id": "ID_DA_BASE_DETECTAVEL_OU_APP_SEU",
       "details": "Nome do Jogo",
       "state": "Jogando",
-      "large_text": "Nome do Jogo"
-    }
+      "large_text": "Nome do Jogo",
+      "large_image": "https://cdn.discordapp.com/app-icons/ID/HASH.png"
+    },
+
+    "rs2client": { "client_id": "" }
   }
 }
