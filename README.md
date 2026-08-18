@@ -235,6 +235,13 @@ Uma thread por app, cada uma esperando o processo aparecer. Se o Discord
 estiver fechado ou o socket cair, a thread tenta de novo no ciclo seguinte
 (15s). O serviço tem `Restart=always`.
 
+O Discord mantém a última atividade publicada mesmo depois que a conexão
+morre — sem cuidado, fechar o app deixaria a presença pendurada com o
+cronômetro correndo. Por isso o daemon apaga as presenças **ao iniciar**
+(restos de execuções anteriores, inclusive de um `restart` anterior) e **ao
+ser encerrado** (`SIGTERM`/`SIGINT`), e nunca publica um estado genérico
+quando o player já sumiu. Se algo ficar preso, `restart` resolve.
+
 ## Desinstalar
 
 ```bash

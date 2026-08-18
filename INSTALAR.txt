@@ -410,8 +410,11 @@ Musica/video sem barra de tempo:
       titulo comecou.
 
 Presenca "presa", de algo que ja fechei:
-    - quem segura e o cliente. Reinicie os dois:
+    - o Discord mantem a ultima atividade publicada mesmo depois que a
+      conexao morre. Por isso o daemon apaga as presencas ao iniciar e
+      ao ser encerrado. Se sobrar alguma coisa presa, basta:
         systemctl --user restart discord-game-presence
+    - so precisa reiniciar o cliente se nem isso resolver:
         pkill vesktop && setsid vesktop >/dev/null 2>&1 &
 
 

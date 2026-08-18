@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -218,8 +219,8 @@ def yt_title():
 def yt_state():
     """Video em reproducao no YouTube: titulo, canal, capa e progresso."""
     player = firefox_player(is_youtube)
-    if not player:
-        return "YouTube", None
+    if not player:  # aba fechada: encerra a presenca em vez de publicar generico
+        return None
     meta = mpris_meta(player)
     channel = meta.get("xesam:artist")
     channel = channel[0] if isinstance(channel, list) and channel else channel
@@ -285,8 +286,8 @@ def ytm_art(meta):
 def ytm_state():
     """Musica atual, progresso na faixa e links."""
     player = ytm_player()
-    if not player:
-        return "YouTube Music", None
+    if not player:  # aba fechada: encerra a presenca em vez de publicar generico
+        return None
     meta = mpris_meta(player)
     artist = meta.get("xesam:artist")
     artist = artist[0] if isinstance(artist, list) and artist else artist
@@ -325,8 +326,8 @@ def ytm_state():
 def stremio_state():
     """Titulo em reproducao e quanto falta para acabar, via MPRIS."""
     status = mpris("PlaybackStatus")
-    if status is None:
-        return "Aberto", None
+    if status is None:  # o Stremio fechou
+        return None
     meta = mpris("Metadata") or {}
 
     def field(key):
@@ -571,6 +572,7 @@ GAMES = {
 }
 
 POLL = 15
+IPC_TIMEOUT = 15
 
 CONFIG = pathlib.Path(
     os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")
@@ -640,6 +642,31 @@ def changed(old, new):
     return old[1] != new[1]
 
 
+def clear_presence(client_id):
+    """Apaga do Discord a presenca desse app.
+
+    Necessario porque o cliente mantem a ultima atividade publicada mesmo
+    depois que a conexao morre: se o daemon for morto (um `systemctl restart`,
+    por exemplo), a presenca fica pendurada ate alguem mandar apagar.
+    """
+    path = ipc_path()
+    if not path:
+        return
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(IPC_TIMEOUT)
+        sock.connect(path)
+        try:
+            send(sock, 0, {"v": 1, "client_id": client_id})
+            send(sock, 1, {"cmd": "SET_ACTIVITY",
+                           "args": {"pid": os.getpid(), "activity": None},
+                           "nonce": str(time.time())})
+        finally:
+            sock.close()
+    except (OSError, ValueError):
+        pass  # Discord fechado: nao ha presenca pendurada para apagar
+
+
 def session(proc, game):
     """Publica a presenca de uma partida, do inicio ao fim do jogo."""
     path = ipc_path()
@@ -647,6 +674,7 @@ def session(proc, game):
         return
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(IPC_TIMEOUT)  # sem isso um Discord mudo travaria a thread
     sock.connect(path)
     send(sock, 0, {"v": 1, "client_id": game["client_id"]})
 
@@ -685,22 +713,34 @@ def session(proc, game):
 
     def current_state():
         s = game["state"]
-        return s() if callable(s) else (s, None)
-
-    state = current_state()
-    publish(state)
+        if not callable(s):
+            return (s, None)
+        return s()  # None significa "nao ha mais nada tocando"
 
     try:
+        state = current_state()
+        if state is None:  # o app saiu entre a checagem e agora
+            return
+        publish(state)
+
         while running(proc):
             time.sleep(POLL)
+            if not running(proc):
+                break  # nao publica nada depois que o app fechou
             new = current_state()
+            if new is None:
+                break
             if changed(state, new):  # ex.: trocou de servidor, deu seek/pausa
                 restart = game.get("timer_per_title") and new[0] != state[0]
                 state = new
                 publish(state, restart)
     finally:
-        send(sock, 1, {"cmd": "SET_ACTIVITY", "args": {"pid": os.getpid()},
-                       "nonce": str(time.time())})
+        try:
+            send(sock, 1, {"cmd": "SET_ACTIVITY",
+                           "args": {"pid": os.getpid(), "activity": None},
+                           "nonce": str(time.time())})
+        except (OSError, ValueError):
+            pass  # IPC ja caiu; o clear do proximo start resolve
         sock.close()
 
 
@@ -718,9 +758,21 @@ def watch(proc, game):
 
 def main():
     load_config()
-    for proc, game in GAMES.items():
-        if not game.get("client_id"):
-            continue  # sem Application ID configurado
+    active = [(proc, game) for proc, game in GAMES.items() if game.get("client_id")]
+    ids = list(dict.fromkeys(game["client_id"] for _, game in active))
+
+    for client_id in ids:  # restos de uma execucao anterior
+        clear_presence(client_id)
+
+    def shutdown(*_):
+        for client_id in ids:
+            clear_presence(client_id)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    for proc, game in active:
         threading.Thread(target=watch, args=(proc, game), daemon=True).start()
     while True:
         time.sleep(3600)
